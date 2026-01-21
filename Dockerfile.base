@@ -1,0 +1,59 @@
+# Base image for DJL Serving with pre-installed conversion tools
+# This base can be used to create model-specific images with pre-converted models
+#
+# Build args:
+#   VARIANT: cpu (default) or cuda
+#   DJL_VERSION: 0.31.0 (default)
+#
+# Usage:
+#   docker build -f Dockerfile.base -t pipestreamai/djl-serving-base:cpu --build-arg VARIANT=cpu .
+#   docker build -f Dockerfile.base -t pipestreamai/djl-serving-base:cuda --build-arg VARIANT=cuda .
+
+ARG VARIANT=cpu
+ARG DJL_VERSION=0.31.0
+
+# Select base image based on variant
+FROM deepjavalibrary/djl-serving:${DJL_VERSION}-cpu-full AS base-cpu
+FROM deepjavalibrary/djl-serving:${DJL_VERSION}-lmi AS base-cuda
+
+# Final stage selects based on VARIANT
+FROM base-${VARIANT} AS final
+
+ARG VARIANT
+ARG DJL_VERSION
+
+# Install conversion tools and dependencies
+# For CPU: install CPU-only torch
+# For CUDA: lmi image already has torch with CUDA support
+RUN if [ "$VARIANT" = "cpu" ]; then \
+        pip3 install torch --index-url https://download.pytorch.org/whl/cpu && \
+        pip3 install huggingface_hub transformers sentence-transformers onnx && \
+        pip3 install https://publish.djl.ai/djl_converter/djl_converter-${DJL_VERSION}-py3-none-any.whl --no-deps; \
+    else \
+        pip3 install huggingface_hub transformers sentence-transformers onnx && \
+        pip3 install https://publish.djl.ai/djl_converter/djl_converter-${DJL_VERSION}-py3-none-any.whl --no-deps; \
+    fi && \
+    pip3 cache purge
+
+# Set environment for caching
+ENV HF_HOME=/tmp/.cache/huggingface
+ENV TRANSFORMERS_CACHE=/tmp/.cache/huggingface/transformers
+ENV DJL_CACHE_DIR=/tmp/.djl.ai
+ENV SERVING_DOWNLOAD_DIR=/tmp/djl-download
+
+# Create model directory
+RUN mkdir -p /opt/ml/model && \
+    mkdir -p /tmp/djl-download
+
+# Configure DJL Serving defaults
+RUN echo 'inference_address=http://0.0.0.0:8080' > /opt/djl/conf/config.properties && \
+    echo 'management_address=http://0.0.0.0:8080' >> /opt/djl/conf/config.properties && \
+    echo 'model_store=/opt/ml/model' >> /opt/djl/conf/config.properties && \
+    echo 'load_models=ALL' >> /opt/djl/conf/config.properties
+
+EXPOSE 8080
+
+LABEL maintainer="pipestream"
+LABEL description="DJL Serving base with conversion tools"
+LABEL variant="${VARIANT}"
+LABEL djl-version="${DJL_VERSION}"
