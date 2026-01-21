@@ -1,0 +1,151 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_bump:
+        description: 'Version bump type'
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+          - manual
+      manual_version:
+        description: 'Manual version (only if "manual" selected above, e.g., 1.2.3)'
+        required: false
+        type: string
+
+env:
+  DOCKER_IMAGE: pipestreamai/djl-serving-embedder
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Determine and create version tag
+        run: |
+          # Get the latest tag
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          echo "Latest tag: $LATEST_TAG"
+
+          # Remove 'v' prefix for version calculation
+          VERSION=${LATEST_TAG#v}
+          IFS='.' read -r -a VERSION_PARTS <<< "$VERSION"
+          MAJOR="${VERSION_PARTS[0]:-0}"
+          MINOR="${VERSION_PARTS[1]:-0}"
+          PATCH="${VERSION_PARTS[2]:-0}"
+
+          # Determine new version based on input
+          if [ "${{ github.event.inputs.version_bump }}" = "manual" ]; then
+            NEW_VERSION="${{ github.event.inputs.manual_version }}"
+            if [ -z "$NEW_VERSION" ]; then
+              echo "Error: Manual version must be specified when using 'manual' bump type"
+              exit 1
+            fi
+          elif [ "${{ github.event.inputs.version_bump }}" = "major" ]; then
+            MAJOR=$((MAJOR + 1))
+            MINOR=0
+            PATCH=0
+            NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          elif [ "${{ github.event.inputs.version_bump }}" = "minor" ]; then
+            MINOR=$((MINOR + 1))
+            PATCH=0
+            NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          else  # patch
+            PATCH=$((PATCH + 1))
+            NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          fi
+
+          NEW_TAG="v${NEW_VERSION}"
+          echo "Creating new tag: $NEW_TAG"
+
+          # Create and push the tag
+          git tag -a "$NEW_TAG" -m "Release $NEW_TAG"
+          git push origin "$NEW_TAG"
+
+          # Export version for subsequent steps
+          echo "RELEASE_VERSION=$NEW_VERSION" >> $GITHUB_ENV
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USER }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and Push CPU Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          build-args: |
+            VARIANT=cpu
+          tags: |
+            ${{ env.DOCKER_IMAGE }}:${{ env.RELEASE_VERSION }}
+            ${{ env.DOCKER_IMAGE }}:latest
+            ghcr.io/ai-pipestream/djl-serving-embedder:${{ env.RELEASE_VERSION }}
+            ghcr.io/ai-pipestream/djl-serving-embedder:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and Push CUDA Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          build-args: |
+            VARIANT=cuda
+          tags: |
+            ${{ env.DOCKER_IMAGE }}:${{ env.RELEASE_VERSION }}-cuda
+            ${{ env.DOCKER_IMAGE }}:latest-cuda
+            ghcr.io/ai-pipestream/djl-serving-embedder:${{ env.RELEASE_VERSION }}-cuda
+            ghcr.io/ai-pipestream/djl-serving-embedder:latest-cuda
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.RELEASE_VERSION }}
+          name: Release ${{ env.RELEASE_VERSION }}
+          generate_release_notes: true
+          body: |
+            ## Docker Images
+
+            ### CPU
+            ```bash
+            docker pull pipestreamai/djl-serving-embedder:${{ env.RELEASE_VERSION }}
+            docker pull ghcr.io/ai-pipestream/djl-serving-embedder:${{ env.RELEASE_VERSION }}
+            ```
+
+            ### CUDA
+            ```bash
+            docker pull pipestreamai/djl-serving-embedder:${{ env.RELEASE_VERSION }}-cuda
+            docker pull ghcr.io/ai-pipestream/djl-serving-embedder:${{ env.RELEASE_VERSION }}-cuda
+            ```
+          token: ${{ secrets.GITHUB_TOKEN }}

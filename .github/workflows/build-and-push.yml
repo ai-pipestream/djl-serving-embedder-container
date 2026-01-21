@@ -1,21 +1,12 @@
-name: Build and Push Docker Images
+name: Build and Test
 
 on:
   push:
     branches:
       - main
-    tags:
-      - 'v*'
   pull_request:
     branches:
       - main
-  workflow_dispatch:
-    inputs:
-      push_image:
-        description: 'Push image to Docker Hub'
-        required: false
-        default: 'false'
-        type: boolean
 
 env:
   DOCKER_IMAGE: pipestreamai/djl-serving-embedder
@@ -30,54 +21,59 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to Docker Hub
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKER_USER }}
-          password: ${{ secrets.DOCKER_TOKEN }}
-
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.DOCKER_IMAGE }}
-          tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable={{is_default_branch}}
-
-      - name: Build and push CPU image
+      - name: Build CPU image
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          push: false
+          load: true
           build-args: |
             VARIANT=cpu
+          tags: ${{ env.DOCKER_IMAGE }}:test-cpu
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: Test CPU image
-        if: github.event_name == 'pull_request'
         run: |
-          docker run -d --name test-cpu -p 8080:8080 ${{ env.DOCKER_IMAGE }}:${{ steps.meta.outputs.version }}
-          sleep 30
-          for i in {1..30}; do
+          docker run -d --name test-cpu -p 8080:8080 ${{ env.DOCKER_IMAGE }}:test-cpu
+          echo "Waiting for container to be ready..."
+          for i in {1..60}; do
             if curl -s http://localhost:8080/ping > /dev/null 2>&1; then
-              echo "Container is ready!"
+              echo "Container is ready after $i attempts!"
               break
             fi
-            echo "Waiting... attempt $i/30"
+            if [ $i -eq 60 ]; then
+              echo "Container failed to start"
+              docker logs test-cpu
+              exit 1
+            fi
             sleep 5
           done
+
+          echo "Testing health endpoint..."
           curl -s http://localhost:8080/ping
+
+          echo ""
+          echo "Testing single embedding..."
+          RESPONSE=$(curl -s -X POST http://localhost:8080/predictions/all_MiniLM_L6_v2 \
+            -H 'Content-Type: application/json' \
+            -d '{"inputs": "Hello world"}')
+          DIMENSION=$(echo $RESPONSE | tr ',' '\n' | wc -l)
+          echo "Embedding dimension: $DIMENSION"
+
+          if [ "$DIMENSION" -ne 384 ]; then
+            echo "Expected 384 dimensions, got $DIMENSION"
+            exit 1
+          fi
+
+          echo ""
+          echo "Testing batch embeddings..."
           curl -s -X POST http://localhost:8080/predictions/all_MiniLM_L6_v2 \
             -H 'Content-Type: application/json' \
-            -d '{"inputs": "Hello world"}' | head -c 200
+            -d '{"inputs": ["Hello world", "Test embedding"]}' | head -c 200
+
+          echo ""
+          echo "All tests passed!"
           docker stop test-cpu
 
   build-cuda:
@@ -89,35 +85,13 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to Docker Hub
-        if: github.event_name != 'pull_request'
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKER_USER }}
-          password: ${{ secrets.DOCKER_TOKEN }}
-
-      - name: Extract metadata for CUDA
-        id: meta-cuda
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.DOCKER_IMAGE }}
-          flavor: |
-            suffix=-cuda
-          tags: |
-            type=ref,event=branch
-            type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable={{is_default_branch}}
-
-      - name: Build and push CUDA image
+      - name: Build CUDA image (no test - requires GPU)
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta-cuda.outputs.tags }}
-          labels: ${{ steps.meta-cuda.outputs.labels }}
+          push: false
           build-args: |
             VARIANT=cuda
+          tags: ${{ env.DOCKER_IMAGE }}:test-cuda
           cache-from: type=gha
           cache-to: type=gha,mode=max
